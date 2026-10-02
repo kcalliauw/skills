@@ -4,3 +4,9 @@ Copyright OpenAI. Licensed under the Apache License, Version 2.0:
 https://www.apache.org/licenses/LICENSE-2.0 (copy in assets/LICENSE-APACHE-2.0).
 It is unmodified. assets/review.schema.json restates the output schema that
 rubric defines, made strict (every property required, priority nullable).
+
+assets/security/*.md are copied unmodified from Cloudflare's security-audit
+skill, https://github.com/cloudflare/security-audit-skill (commit
+c1c8a8c1471069fb0e188eeaff69b8e8db6564a8), Copyright (c) 2025-2026 Cloudflare, Inc., MIT
+License (copy in assets/security/LICENSE-CLOUDFLARE-MIT).
+assets/security-rubric.md adapts that skill's core method to a single diff.

@@ -1,13 +1,18 @@
 ---
 name: cross-review
-description: Review a diff locally with Codex and Claude Code side by side, using the Codex review rubric, and get one merged list of prioritized findings. Use before opening a pull request, before requesting a hosted review round, or when asked for a local, second-opinion or cross-model review of a branch, a commit or uncommitted changes.
+description: Review a diff locally with Codex and Claude Code side by side, with a code-review pass (the Codex review rubric) and a security pass, and get one merged list of prioritized findings. Use before opening a pull request, before requesting a hosted review round, or when asked for a local, second-opinion or cross-model review of a branch, a commit or uncommitted changes.
 metadata:
   internal: true
 ---
 
 # Cross-review
 
-Run two independent reviewers on the same diff and act on their merged findings. Both get the Codex `/review` rubric as their system prompt, the same target prompt and the same JSON output schema, so their findings are comparable and merge by location.
+Run two independent reviewers on the same diff, each in two passes, and act on their merged findings:
+
+- **code review**: the Codex `/review` rubric as the system prompt;
+- **security**: a diff-scoped security rubric adapted from Cloudflare's security-audit skill, with its attack-class references in `assets/security/`.
+
+Every pass gets the same target prompt and JSON output schema, so findings are comparable and merge by location.
 
 ## Run it
 
@@ -19,7 +24,7 @@ python3 <this-skill-dir>/scripts/cross-review --commit <sha>     # one commit
 python3 <this-skill-dir>/scripts/cross-review --uncommitted      # staged, unstaged and untracked work
 ```
 
-Options: `--focus "<text>"` adds a review focus; `--reviewers codex` or `--reviewers claude` runs one reviewer; `--json` prints the merged report; `--timeout <seconds>` per reviewer (default 900).
+Options: `--focus "<text>"` adds a review focus; `--reviewers codex` or `--reviewers claude` runs one reviewer; `--no-security` skips the security pass (`--passes security` runs only it); `--json` prints the merged report; `--timeout <seconds>` per pass (default 900).
 
 - The reviewers call their model APIs. In a sandbox without network access, run the command outside the sandbox (request escalated permissions) rather than letting it fail.
 - A run takes about one to fifteen minutes; run it in the background when your environment allows, and wait for it rather than polling.
@@ -27,7 +32,7 @@ Options: `--focus "<text>"` adds a review focus; `--reviewers codex` or `--revie
 
 ## Act on the result
 
-Each row reads `P<n>  <reviewers>  <path:lines>  <title>`, followed by the explanation. A row found by both reviewers is stronger evidence; a row from one reviewer still counts.
+Each row reads `P<n> [sec] <reviewers> <path:lines> <title>`, followed by the explanation; `sec` marks a security finding. A row found by both reviewers is stronger evidence; a row from one reviewer still counts.
 
 1. Read every finding before changing anything; several rows often share one root cause.
 2. Fix P0 and P1 findings. Fix P2 findings that are local and in scope. For each finding you decline, write a one-line reason (wrong about the code, pre-existing, outside the change's scope).

@@ -81,6 +81,30 @@ class NormalizeAndMergeTests(unittest.TestCase):
         b = cr.normalize(review(finding("Off-by-one", "/r/a.py", 40)), "claude", Path("/r"))
         self.assertEqual(len(cr.merge(a + b)), 2)
 
+    def test_security_prefix_is_stripped_and_marked(self):
+        item = finding("[P1] [security] Check tenant ownership", "/r/a.py", 3, priority=None)
+        [f] = cr.normalize(review(item), "claude", Path("/r"))
+        self.assertEqual((f.priority, f.title, f.kind), (1, "Check tenant ownership", "security"))
+
+    def test_security_pass_findings_merge_across_reviewers(self):
+        a = cr.normalize(review(finding("[security] Leaks customer id", "/r/a.py", 5)), "codex-security", Path("/r"))
+        b = cr.normalize(review(finding("[security] Customer id leaked", "/r/a.py", 5)), "claude-security", Path("/r"))
+        [group] = cr.merge(a + b)
+        self.assertTrue(group.security)
+        self.assertEqual(group.sources, ["claude", "codex"])
+
+    def test_security_system_prompt_keeps_the_output_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            text = cr.security_system_prompt(Path(tmp)).read_text()
+        self.assertIn("Security review guidelines", text)
+        self.assertIn("overall_correctness", text)
+        self.assertIn(str(cr.SECURITY_DIR), text)
+        self.assertNotIn("{security_dir}", text)
+
+    def test_untagged_finding_from_security_pass_is_not_security(self):
+        [f] = cr.normalize(review(finding("[P2] Off-by-one", "/r/a.py", 3)), "claude-security", Path("/r"))
+        self.assertEqual(f.kind, "review")
+
     def test_parse_json_object_tolerates_prose(self):
         self.assertEqual(cr.parse_json_object('Result:\n{"a": 1}\nDone'), {"a": 1})
 
@@ -147,6 +171,19 @@ class EndToEndTests(unittest.TestCase):
     def test_commit_target(self):
         result = self.run_tool("--commit", "HEAD", "--json")
         self.assertEqual(json.loads(result.stdout)["target"]["kind"], "commit")
+
+    def test_security_pass_runs_by_default_and_is_reported(self):
+        path = str(self.repo / "a.py")
+        self.write("sec.json", review(finding("[P1] [security] Index from untrusted input", path, 2)))
+        self.env["FAKE_CLAUDE_SECURITY_REVIEW"] = str(self.root / "sec.json")
+        data = json.loads(self.run_tool("--base", "main", "--json").stdout)
+        self.assertEqual(sorted(r["name"] for r in data["reviewers"]),
+                         ["claude", "claude-security", "codex", "codex-security"])
+        self.assertTrue(any(f["security"] for f in data["findings"]))
+
+    def test_no_security_runs_only_the_review_pass(self):
+        data = json.loads(self.run_tool("--base", "main", "--json", "--no-security").stdout)
+        self.assertEqual(sorted(r["name"] for r in data["reviewers"]), ["claude", "codex"])
 
     def test_unknown_reviewer_is_a_usage_error(self):
         self.assertEqual(self.run_tool("--reviewers", "gemini").returncode, 3)

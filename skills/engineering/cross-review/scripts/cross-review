@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Run Codex and Claude Code as independent code reviewers on the same diff.
+"""Run Codex and Claude Code as independent code and security reviewers on one diff.
 
-Both reviewers get the Codex review rubric as their system prompt, the same
-target prompt that Codex's /review builds, and the same JSON output schema.
-Findings are merged by location and printed as one table.
+Each reviewer runs two passes in parallel: a code review with the Codex review
+rubric as its system prompt, and a security review with a diff-scoped security
+rubric. Every pass gets the target prompt that Codex's /review builds and the
+same JSON output schema. Findings are merged by location and printed as one table.
 
 Exit codes: 0 no P0/P1 findings, 1 P0/P1 findings, 2 no reviewer produced a
 result, 3 usage error.
@@ -28,8 +29,12 @@ from pathlib import Path
 
 SKILL_DIR = Path(os.path.realpath(__file__)).parent.parent
 RUBRIC = SKILL_DIR / "assets" / "rubric.md"
+SECURITY_RUBRIC = SKILL_DIR / "assets" / "security-rubric.md"
+SECURITY_DIR = SKILL_DIR / "assets" / "security"
 SCHEMA = SKILL_DIR / "assets" / "review.schema.json"
 REVIEWERS = ("codex", "claude")
+PASSES = ("review", "security")
+OUTPUT_SECTION_START = "At the beginning of the finding title, tag the bug with priority level."
 
 # Target prompts, verbatim from codex-rs/prompts/src/review_request.rs.
 UNCOMMITTED_PROMPT = (
@@ -70,6 +75,7 @@ CLAUDE_TOOLS = [
 
 LIMIT_PATTERN = re.compile(r"usage limit|rate limit|quota|too many requests", re.I)
 PRIORITY_PREFIX = re.compile(r"^\s*\[P([0-3])\]\s*")
+SECURITY_PREFIX = re.compile(r"^\s*\[security\]\s*", re.I)
 
 
 class UsageError(Exception):
@@ -143,9 +149,23 @@ def build_prompt(target: Target, focus: str | None) -> str:
     return "\n\n".join(parts)
 
 
+def security_system_prompt(out_dir: Path) -> Path:
+    """The security rubric plus the output contract of the Codex rubric."""
+    rubric = RUBRIC.read_text()
+    start = rubric.find(OUTPUT_SECTION_START)
+    if start < 0:
+        raise UsageError("the vendored rubric no longer contains its output section")
+    text = SECURITY_RUBRIC.read_text().replace("{security_dir}", str(SECURITY_DIR))
+    path = out_dir / "security-system-prompt.md"
+    path.write_text(text.rstrip() + "\n\n## Output format\n\n" + rubric[start:])
+    return path
+
+
 @dataclass
 class Run:
     name: str
+    reviewer: str
+    kind: str  # review | security
     command: list[str]
     out_dir: Path
     timeout: int
@@ -166,26 +186,27 @@ class Run:
         return self.out_dir / f"{self.name}.stderr"
 
 
-def codex_command(prompt: str, out_dir: Path, args: argparse.Namespace) -> list[str]:
+def codex_command(name: str, system: Path, prompt: str, out_dir: Path, args: argparse.Namespace) -> list[str]:
     command = [
         "codex", "exec", "--ephemeral", "--skip-git-repo-check",
         "-s", "read-only",
-        "-c", f"model_instructions_file={RUBRIC}",
+        "-c", f"model_instructions_file={system}",
         "-c", "web_search=disabled",
         "--output-schema", str(SCHEMA),
-        "-o", str(out_dir / "codex.json"),
+        "-o", str(out_dir / f"{name}.json"),
     ]
     if args.codex_model:
         command += ["-m", args.codex_model]
     return command + [prompt]
 
 
-def claude_command(prompt: str, args: argparse.Namespace) -> list[str]:
+def claude_command(system: Path, prompt: str, args: argparse.Namespace) -> list[str]:
     # --allowedTools is variadic, so a fixed flag must follow it before the prompt.
     command = [
         "claude", "-p",
         "--allowedTools", *CLAUDE_TOOLS,
-        "--append-system-prompt-file", str(RUBRIC),
+        "--add-dir", str(SECURITY_DIR),
+        "--append-system-prompt-file", str(system),
         "--json-schema", SCHEMA.read_text(),
         "--output-format", "json",
     ]
@@ -264,7 +285,7 @@ def collect_codex(run: Run) -> None:
         else:
             run.detail = run.detail or stderr
         return
-    path = run.out_dir / "codex.json"
+    path = run.out_dir / f"{run.name}.json"
     review = parse_json_object(path.read_text()) if path.exists() else None
     if review is None:
         run.status, run.detail = "failed", "no parsable review in the last message"
@@ -305,6 +326,7 @@ class Finding:
     start: int
     end: int
     source: str
+    kind: str = "review"
 
 
 def relative_path(path: str, repo: Path) -> str:
@@ -324,6 +346,12 @@ def normalize(review: dict, source: str, repo: Path) -> list[Finding]:
             if priority is None:
                 priority = int(match.group(1))
             title = title[match.end():]
+        # Security is decided by the title tag, not the pass: a security pass may
+        # also report an ordinary bug, which it leaves untagged.
+        is_security = False
+        tag = SECURITY_PREFIX.match(title)
+        if tag:
+            title, is_security = title[tag.end():], True
         location = item.get("code_location") or {}
         lines = location.get("line_range") or {}
         start = int(lines.get("start") or 0)
@@ -337,6 +365,7 @@ def normalize(review: dict, source: str, repo: Path) -> list[Finding]:
                 start=start,
                 end=int(lines.get("end") or start),
                 source=source,
+                kind="security" if is_security else "review",
             )
         )
     return findings
@@ -357,7 +386,11 @@ class Merged:
 
     @property
     def sources(self) -> list[str]:
-        return sorted({f.source for f in self.members})
+        return sorted({f.source.removesuffix("-security") for f in self.members})
+
+    @property
+    def security(self) -> bool:
+        return any(f.kind == "security" for f in self.members)
 
     @property
     def start(self) -> int:
@@ -404,14 +437,15 @@ def render(target: Target, runs: list[Run], groups: list[Merged], out_dir: Path)
         count = len(review.get("findings") or [])
         verdict = review.get("overall_correctness", "")
         extra = run.detail if run.status != "ok" else f"{count} finding(s), {verdict}"
-        lines.append(f"  {run.name:<7}{run.status:<9}{run.seconds:>5.0f}s  {extra}")
+        lines.append(f"  {run.name:<16}{run.status:<9}{run.seconds:>5.0f}s  {extra}")
     lines.append("")
     if not groups:
         lines.append("No findings.")
     for group in groups:
         lead = group.lead
         where = f"{lead.path}:{group.start}" + (f"-{group.end}" if group.end != group.start else "")
-        lines.append(f"{label(group.priority)}  {'+'.join(group.sources):<13} {where}  {lead.title}")
+        tag = "sec" if group.security else "   "
+        lines.append(f"{label(group.priority)} {tag} {'+'.join(group.sources):<13} {where}  {lead.title}")
         lines.append(textwrap.indent(textwrap.fill(lead.body, 96), "    "))
         for other in group.members:
             if other is not lead and other.title.lower() != lead.title.lower():
@@ -438,7 +472,7 @@ def report(target: Target, runs: list[Run], groups: list[Merged]) -> dict:
         ],
         "findings": [
             {
-                "priority": g.priority, "sources": g.sources, "path": g.lead.path,
+                "priority": g.priority, "security": g.security, "sources": g.sources, "path": g.lead.path,
                 "start": g.start, "end": g.end, "title": g.lead.title, "body": g.lead.body,
                 "members": [f.__dict__ for f in g.members],
             }
@@ -455,6 +489,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     target.add_argument("--uncommitted", action="store_true", help="review staged, unstaged and untracked changes")
     parser.add_argument("--title", help="commit title shown to reviewers with --commit")
     parser.add_argument("--reviewers", default=",".join(REVIEWERS), help="comma-separated: codex,claude")
+    parser.add_argument("--passes", default=",".join(PASSES), help="comma-separated: review,security (default both)")
+    parser.add_argument("--no-security", action="store_true", help="skip the security pass (same as --passes review)")
     parser.add_argument("--focus", help="extra review focus appended to the prompt")
     parser.add_argument("--timeout", type=int, default=900, help="seconds per reviewer (default 900)")
     parser.add_argument("--out", help="directory for raw outputs (default: a new temporary directory)")
@@ -474,6 +510,9 @@ def main(argv: list[str]) -> int:
         unknown = set(wanted) - set(REVIEWERS)
         if unknown or not wanted:
             raise UsageError(f"unknown reviewer(s): {', '.join(sorted(unknown)) or 'none given'}")
+        passes = [p.strip() for p in ("review" if args.no_security else args.passes).split(",") if p.strip()]
+        if set(passes) - set(PASSES) or not passes:
+            raise UsageError(f"unknown pass(es) in {args.passes!r}; use review,security")
     except UsageError as error:
         print(f"cross-review: {error}", file=sys.stderr)
         return 3
@@ -485,21 +524,27 @@ def main(argv: list[str]) -> int:
     prompt = build_prompt(target, args.focus)
     (out_dir / "prompt.txt").write_text(prompt + "\n")
 
+    systems = {"review": RUBRIC}
+    if "security" in passes:
+        systems["security"] = security_system_prompt(out_dir)
     runs = []
-    for name in wanted:
-        command = codex_command(prompt, out_dir, args) if name == "codex" else claude_command(prompt, args)
-        run = Run(name, command, out_dir, args.timeout)
-        if shutil.which(name) is None:
-            run.status, run.detail = "skipped", f"`{name}` is not on PATH"
-        else:
-            start(run, repo)
-        runs.append(run)
+    for kind in passes:
+        for reviewer in wanted:
+            name = reviewer if kind == "review" else f"{reviewer}-security"
+            system = systems[kind]
+            command = (codex_command(name, system, prompt, out_dir, args) if reviewer == "codex"
+                       else claude_command(system, prompt, args))
+            run = Run(name, reviewer, kind, command, out_dir, args.timeout)
+            if shutil.which(reviewer) is None:
+                run.status, run.detail = "skipped", f"`{reviewer}` is not on PATH"
+            else:
+                start(run, repo)
+            runs.append(run)
     wait_all(runs)
     for run in runs:
-        if run.name == "codex" and run.status != "skipped":
-            collect_codex(run)
-        elif run.name == "claude" and run.status != "skipped":
-            collect_claude(run)
+        if run.status == "skipped":
+            continue
+        (collect_codex if run.reviewer == "codex" else collect_claude)(run)
 
     findings = [f for run in runs if run.review for f in normalize(run.review, run.name, repo)]
     groups = merge(findings)
