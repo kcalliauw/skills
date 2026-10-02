@@ -1,0 +1,17 @@
+{
+  "name": "kcalliauw-skills",
+  "version": "0.1.0",
+  "description": "Agent skills for Claude Code, Codex and OpenCode: cross-model code review, PR babysitting, and service exposure over Tailscale.",
+  "author": {
+    "name": "Koen Calliauw",
+    "url": "https://github.com/kcalliauw"
+  },
+  "repository": "https://github.com/kcalliauw/skills",
+  "license": "MIT",
+  "keywords": ["code-review", "codex", "claude-code", "opencode", "pull-requests", "tailscale"],
+  "skills": [
+    "./skills/engineering/babysit-pr",
+    "./skills/engineering/cross-review",
+    "./skills/ops/expose-service"
+  ]
+}

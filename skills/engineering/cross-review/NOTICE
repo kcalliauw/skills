@@ -1,0 +1,6 @@
+assets/rubric.md is copied from the OpenAI Codex repository,
+https://github.com/openai/codex/blob/bee28e8a061c38c781c74299f2c1d90e3732da18/codex-rs/prompts/templates/review/rubric.md
+Copyright OpenAI. Licensed under the Apache License, Version 2.0:
+https://www.apache.org/licenses/LICENSE-2.0 (copy in assets/LICENSE-APACHE-2.0).
+It is unmodified. assets/review.schema.json restates the output schema that
+rubric defines, made strict (every property required, priority nullable).

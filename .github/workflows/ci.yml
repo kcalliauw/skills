@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Lint skills
+        run: scripts/check-skills
+      - name: Test cross-review
+        run: python3 -m unittest discover -s skills/engineering/cross-review/tests -v
+      - name: Shellcheck
+        run: shellcheck skills/*/*/scripts/*.sh
+      - name: Installer discovers every skill
+        env:
+          DISABLE_TELEMETRY: "1"
+          INSTALL_INTERNAL_SKILLS: "1"
+        run: |
+          out="$(npx -y skills add . --list 2>&1)"
+          echo "$out"
+          for skill in skills/*/*/; do
+            name="$(basename "$skill")"
+            grep -q "$name" <<<"$out" || { echo "installer did not list $name"; exit 1; }
+          done

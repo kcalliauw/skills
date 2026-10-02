@@ -1,0 +1,9 @@
+#!/usr/bin/env python3
+"""Fake `claude -p`: prints an envelope whose structured_output is FAKE_CLAUDE_REVIEW."""
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ["FAKE_LOG"], "a") as log:
+    log.write("claude " + " ".join(a.replace("\n", " ")[:80] for a in args) + "\n")
+review = json.load(open(os.environ["FAKE_CLAUDE_REVIEW"]))
+print(json.dumps({"type": "result", "is_error": False, "result": json.dumps(review),
+                  "structured_output": review, "total_cost_usd": 0.01, "num_turns": 2}))

@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+"""Run Codex and Claude Code as independent code reviewers on the same diff.
+
+Both reviewers get the Codex review rubric as their system prompt, the same
+target prompt that Codex's /review builds, and the same JSON output schema.
+Findings are merged by location and printed as one table.
+
+Exit codes: 0 no P0/P1 findings, 1 P0/P1 findings, 2 no reviewer produced a
+result, 3 usage error.
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+SKILL_DIR = Path(os.path.realpath(__file__)).parent.parent
+RUBRIC = SKILL_DIR / "assets" / "rubric.md"
+SCHEMA = SKILL_DIR / "assets" / "review.schema.json"
+REVIEWERS = ("codex", "claude")
+
+# Target prompts, verbatim from codex-rs/prompts/src/review_request.rs.
+UNCOMMITTED_PROMPT = (
+    "Review the current code changes (staged, unstaged, and untracked files) "
+    "and provide prioritized findings."
+)
+BASE_BRANCH_PROMPT = (
+    "Review the code changes against the base branch '{base_branch}'. The merge "
+    "base commit for this comparison is {merge_base_sha}. Run `git diff "
+    "{merge_base_sha}` to inspect the changes relative to {base_branch}. Provide "
+    "prioritized, actionable findings."
+)
+COMMIT_PROMPT = (
+    "Review the code changes introduced by commit {sha}. Provide prioritized, "
+    "actionable findings."
+)
+COMMIT_PROMPT_WITH_TITLE = (
+    'Review the code changes introduced by commit {sha} ("{title}"). Provide '
+    "prioritized, actionable findings."
+)
+RULES_HINT = (
+    "Before reviewing, read the AGENTS.md files that apply to the changed paths "
+    "(the repository root and any nested ones) and apply their review rules, "
+    "such as a `## Code Review Rules` section."
+)
+
+CLAUDE_TOOLS = [
+    "Read",
+    "Grep",
+    "Glob",
+    "Bash(git diff:*)",
+    "Bash(git show:*)",
+    "Bash(git log:*)",
+    "Bash(git status:*)",
+    "Bash(git blame:*)",
+    "Bash(git ls-files:*)",
+]
+
+LIMIT_PATTERN = re.compile(r"usage limit|rate limit|quota|too many requests", re.I)
+PRIORITY_PREFIX = re.compile(r"^\s*\[P([0-3])\]\s*")
+
+
+class UsageError(Exception):
+    pass
+
+
+def git(repo: Path, *args: str, check: bool = True) -> str:
+    result = subprocess.run(
+        ["git", *args], cwd=repo, capture_output=True, text=True, stdin=subprocess.DEVNULL
+    )
+    if check and result.returncode != 0:
+        raise UsageError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+def default_base(repo: Path) -> str:
+    head = git(repo, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD", check=False)
+    if head:
+        return head.rsplit("/", 1)[-1]
+    for name in ("main", "master"):
+        if git(repo, "rev-parse", "--verify", "--quiet", name, check=False):
+            return name
+    raise UsageError("cannot find a default base branch; pass --base")
+
+
+def comparison_ref(repo: Path, base: str) -> str:
+    """Use the base's upstream when it exists and is ahead, as Codex does."""
+    upstream = git(repo, "rev-parse", "--abbrev-ref", f"{base}@{{upstream}}", check=False)
+    if upstream and git(repo, "rev-parse", "--verify", "--quiet", upstream, check=False):
+        ahead = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", base, upstream], cwd=repo
+        ).returncode == 0
+        if ahead:
+            return upstream
+    return base
+
+
+@dataclass
+class Target:
+    kind: str  # base | commit | uncommitted
+    label: str
+    prompt: str
+    ref: str = ""
+    merge_base: str = ""
+
+
+def resolve_target(repo: Path, args: argparse.Namespace) -> Target:
+    if args.uncommitted:
+        return Target("uncommitted", "uncommitted changes", UNCOMMITTED_PROMPT)
+    if args.commit:
+        sha = git(repo, "rev-parse", "--verify", f"{args.commit}^{{commit}}")
+        title = args.title or git(repo, "log", "-1", "--format=%s", sha)
+        template = COMMIT_PROMPT_WITH_TITLE if title else COMMIT_PROMPT
+        return Target("commit", f"commit {sha[:7]}", template.format(sha=sha, title=title), ref=sha)
+    base = args.base or default_base(repo)
+    ref = comparison_ref(repo, base)
+    git(repo, "rev-parse", "--verify", f"{ref}^{{commit}}")
+    merge_base = git(repo, "merge-base", "HEAD", ref)
+    if not git(repo, "diff", "--stat", merge_base, check=False) and not git(
+        repo, "status", "--porcelain", check=False
+    ):
+        raise UsageError(f"no changes between HEAD and {ref}")
+    prompt = BASE_BRANCH_PROMPT.format(base_branch=ref, merge_base_sha=merge_base)
+    return Target("base", f"changes against {ref} (merge base {merge_base[:7]})", prompt, ref, merge_base)
+
+
+def build_prompt(target: Target, focus: str | None) -> str:
+    parts = [target.prompt, RULES_HINT]
+    if focus:
+        parts.append(f"Additional focus from the requester: {focus}")
+    return "\n\n".join(parts)
+
+
+@dataclass
+class Run:
+    name: str
+    command: list[str]
+    out_dir: Path
+    timeout: int
+    process: subprocess.Popen | None = None
+    started: float = 0.0
+    seconds: float = 0.0
+    status: str = "pending"  # ok | failed | timeout | skipped
+    detail: str = ""
+    review: dict | None = None
+    meta: dict = field(default_factory=dict)
+
+    @property
+    def stdout_path(self) -> Path:
+        return self.out_dir / f"{self.name}.stdout"
+
+    @property
+    def stderr_path(self) -> Path:
+        return self.out_dir / f"{self.name}.stderr"
+
+
+def codex_command(prompt: str, out_dir: Path, args: argparse.Namespace) -> list[str]:
+    command = [
+        "codex", "exec", "--ephemeral", "--skip-git-repo-check",
+        "-s", "read-only",
+        "-c", f"model_instructions_file={RUBRIC}",
+        "-c", "web_search=disabled",
+        "--output-schema", str(SCHEMA),
+        "-o", str(out_dir / "codex.json"),
+    ]
+    if args.codex_model:
+        command += ["-m", args.codex_model]
+    return command + [prompt]
+
+
+def claude_command(prompt: str, args: argparse.Namespace) -> list[str]:
+    # --allowedTools is variadic, so a fixed flag must follow it before the prompt.
+    command = [
+        "claude", "-p",
+        "--allowedTools", *CLAUDE_TOOLS,
+        "--append-system-prompt-file", str(RUBRIC),
+        "--json-schema", SCHEMA.read_text(),
+        "--output-format", "json",
+    ]
+    if args.claude_model:
+        command += ["--model", args.claude_model]
+    return command + ["--no-session-persistence", prompt]
+
+
+def start(run: Run, repo: Path) -> None:
+    run.started = time.monotonic()
+    run.process = subprocess.Popen(
+        run.command,
+        cwd=repo,
+        stdin=subprocess.DEVNULL,  # codex exec otherwise waits for stdin
+        stdout=run.stdout_path.open("w"),
+        stderr=run.stderr_path.open("w"),
+        start_new_session=True,
+    )
+
+
+def wait_all(runs: list[Run]) -> None:
+    pending = [r for r in runs if r.process]
+    while pending:
+        for run in list(pending):
+            code = run.process.poll()
+            elapsed = time.monotonic() - run.started
+            if code is None and elapsed > run.timeout:
+                os.killpg(run.process.pid, signal.SIGTERM)
+                try:
+                    run.process.wait(10)
+                except subprocess.TimeoutExpired:
+                    os.killpg(run.process.pid, signal.SIGKILL)
+                    run.process.wait()
+                run.status, run.detail = "timeout", f"no result after {run.timeout}s"
+            elif code is not None:
+                run.status = "ok" if code == 0 else "failed"
+                if code != 0:
+                    run.detail = f"exit {code}"
+            else:
+                continue
+            run.seconds = elapsed
+            pending.remove(run)
+        if pending:
+            time.sleep(0.5)
+
+
+def tail(path: Path, lines: int = 3) -> str:
+    try:
+        text = path.read_text(errors="replace").strip().splitlines()
+    except FileNotFoundError:
+        return ""
+    return " | ".join(text[-lines:])
+
+
+def parse_json_object(text: str) -> dict | None:
+    """Parse JSON, tolerating prose around it, as Codex's own parser does."""
+    try:
+        value = json.loads(text)
+        return value if isinstance(value, dict) else None
+    except json.JSONDecodeError:
+        start, end = text.find("{"), text.rfind("}")
+        if 0 <= start < end:
+            try:
+                value = json.loads(text[start : end + 1])
+                return value if isinstance(value, dict) else None
+            except json.JSONDecodeError:
+                return None
+    return None
+
+
+def collect_codex(run: Run) -> None:
+    stderr = tail(run.stderr_path, 5)
+    if run.status != "ok":
+        if LIMIT_PATTERN.search(stderr):
+            run.status, run.detail = "skipped", "usage limit reached"
+        else:
+            run.detail = run.detail or stderr
+        return
+    path = run.out_dir / "codex.json"
+    review = parse_json_object(path.read_text()) if path.exists() else None
+    if review is None:
+        run.status, run.detail = "failed", "no parsable review in the last message"
+        return
+    run.review = review
+
+
+def collect_claude(run: Run) -> None:
+    raw = run.stdout_path.read_text(errors="replace") if run.stdout_path.exists() else ""
+    envelope = parse_json_object(raw) or {}
+    run.meta = {
+        k: envelope.get(k) for k in ("total_cost_usd", "num_turns", "duration_ms") if k in envelope
+    }
+    if run.status != "ok" or envelope.get("is_error"):
+        message = str(envelope.get("result") or tail(run.stderr_path, 5))
+        if LIMIT_PATTERN.search(message):
+            run.status, run.detail = "skipped", "usage limit reached"
+        else:
+            run.status = "failed" if run.status == "ok" else run.status
+            run.detail = run.detail or message[:300]
+        return
+    review = envelope.get("structured_output")
+    if not isinstance(review, dict):
+        review = parse_json_object(str(envelope.get("result", "")))
+    if not isinstance(review, dict):
+        run.status, run.detail = "failed", "no structured review in the output"
+        return
+    run.review = review
+
+
+@dataclass
+class Finding:
+    title: str
+    body: str
+    priority: int | None
+    confidence: float | None
+    path: str
+    start: int
+    end: int
+    source: str
+
+
+def relative_path(path: str, repo: Path) -> str:
+    try:
+        return str(Path(path).resolve().relative_to(repo.resolve()))
+    except ValueError:
+        return path
+
+
+def normalize(review: dict, source: str, repo: Path) -> list[Finding]:
+    findings = []
+    for item in review.get("findings") or []:
+        title = str(item.get("title", "")).strip()
+        priority = item.get("priority")
+        match = PRIORITY_PREFIX.match(title)
+        if match:
+            if priority is None:
+                priority = int(match.group(1))
+            title = title[match.end():]
+        location = item.get("code_location") or {}
+        lines = location.get("line_range") or {}
+        start = int(lines.get("start") or 0)
+        findings.append(
+            Finding(
+                title=title,
+                body=str(item.get("body", "")).strip(),
+                priority=priority if isinstance(priority, int) else None,
+                confidence=item.get("confidence_score"),
+                path=relative_path(str(location.get("absolute_file_path", "")), repo),
+                start=start,
+                end=int(lines.get("end") or start),
+                source=source,
+            )
+        )
+    return findings
+
+
+@dataclass
+class Merged:
+    members: list[Finding]
+
+    @property
+    def lead(self) -> Finding:
+        return min(self.members, key=lambda f: (f.priority if f.priority is not None else 9, -(f.confidence or 0)))
+
+    @property
+    def priority(self) -> int | None:
+        known = [f.priority for f in self.members if f.priority is not None]
+        return min(known) if known else None
+
+    @property
+    def sources(self) -> list[str]:
+        return sorted({f.source for f in self.members})
+
+    @property
+    def start(self) -> int:
+        return min(f.start for f in self.members)
+
+    @property
+    def end(self) -> int:
+        return max(f.end for f in self.members)
+
+
+def same_issue(a: Finding, b: Finding) -> bool:
+    if a.source == b.source or a.path != b.path:
+        return False
+    near = a.start <= b.end + 3 and b.start <= a.end + 3
+    if not near:
+        return False
+    overlap = a.start <= b.end and b.start <= a.end
+    similarity = difflib.SequenceMatcher(None, a.title.lower(), b.title.lower()).ratio()
+    return overlap or similarity >= 0.35
+
+
+def merge(findings: list[Finding]) -> list[Merged]:
+    groups: list[Merged] = []
+    for finding in findings:
+        for group in groups:
+            if all(m.source != finding.source for m in group.members) and any(
+                same_issue(m, finding) for m in group.members
+            ):
+                group.members.append(finding)
+                break
+        else:
+            groups.append(Merged([finding]))
+    return sorted(groups, key=lambda g: (g.priority if g.priority is not None else 9, g.lead.path, g.start))
+
+
+def label(priority: int | None) -> str:
+    return f"P{priority}" if priority is not None else "P?"
+
+
+def render(target: Target, runs: list[Run], groups: list[Merged], out_dir: Path) -> str:
+    lines = [f"cross-review: {target.label}"]
+    for run in runs:
+        review = run.review or {}
+        count = len(review.get("findings") or [])
+        verdict = review.get("overall_correctness", "")
+        extra = run.detail if run.status != "ok" else f"{count} finding(s), {verdict}"
+        lines.append(f"  {run.name:<7}{run.status:<9}{run.seconds:>5.0f}s  {extra}")
+    lines.append("")
+    if not groups:
+        lines.append("No findings.")
+    for group in groups:
+        lead = group.lead
+        where = f"{lead.path}:{group.start}" + (f"-{group.end}" if group.end != group.start else "")
+        lines.append(f"{label(group.priority)}  {'+'.join(group.sources):<13} {where}  {lead.title}")
+        lines.append(textwrap.indent(textwrap.fill(lead.body, 96), "    "))
+        for other in group.members:
+            if other is not lead and other.title.lower() != lead.title.lower():
+                lines.append(f"    ({other.source}: {label(other.priority)} {other.title})")
+        lines.append("")
+    for run in runs:
+        if run.review and run.review.get("overall_explanation"):
+            lines.append(f"{run.name}: {run.review['overall_explanation']}")
+    lines.append(f"Full output: {out_dir}")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def report(target: Target, runs: list[Run], groups: list[Merged]) -> dict:
+    return {
+        "target": {"kind": target.kind, "label": target.label, "ref": target.ref, "merge_base": target.merge_base},
+        "reviewers": [
+            {
+                "name": r.name, "status": r.status, "detail": r.detail, "seconds": round(r.seconds, 1),
+                "overall_correctness": (r.review or {}).get("overall_correctness"),
+                "overall_explanation": (r.review or {}).get("overall_explanation"),
+                **r.meta,
+            }
+            for r in runs
+        ],
+        "findings": [
+            {
+                "priority": g.priority, "sources": g.sources, "path": g.lead.path,
+                "start": g.start, "end": g.end, "title": g.lead.title, "body": g.lead.body,
+                "members": [f.__dict__ for f in g.members],
+            }
+            for g in groups
+        ],
+    }
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="cross-review", description=__doc__.split("\n\n")[0])
+    target = parser.add_mutually_exclusive_group()
+    target.add_argument("--base", help="review changes against this branch (default: the repository's default branch)")
+    target.add_argument("--commit", help="review the changes introduced by this commit")
+    target.add_argument("--uncommitted", action="store_true", help="review staged, unstaged and untracked changes")
+    parser.add_argument("--title", help="commit title shown to reviewers with --commit")
+    parser.add_argument("--reviewers", default=",".join(REVIEWERS), help="comma-separated: codex,claude")
+    parser.add_argument("--focus", help="extra review focus appended to the prompt")
+    parser.add_argument("--timeout", type=int, default=900, help="seconds per reviewer (default 900)")
+    parser.add_argument("--out", help="directory for raw outputs (default: a new temporary directory)")
+    parser.add_argument("--json", action="store_true", help="print the merged report as JSON")
+    parser.add_argument("--codex-model", help="model for the Codex reviewer")
+    parser.add_argument("--claude-model", help="model for the Claude reviewer")
+    parser.add_argument("-C", "--repo", default=".", help="repository to review (default: current directory)")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    try:
+        repo = Path(git(Path(args.repo), "rev-parse", "--show-toplevel"))
+        target = resolve_target(repo, args)
+        wanted = [name.strip() for name in args.reviewers.split(",") if name.strip()]
+        unknown = set(wanted) - set(REVIEWERS)
+        if unknown or not wanted:
+            raise UsageError(f"unknown reviewer(s): {', '.join(sorted(unknown)) or 'none given'}")
+    except UsageError as error:
+        print(f"cross-review: {error}", file=sys.stderr)
+        return 3
+
+    out_dir = Path(args.out) if args.out else Path(
+        tempfile.mkdtemp(prefix=f"cross-review-{repo.name}-", dir=os.environ.get("TMPDIR"))
+    )
+    out_dir.mkdir(parents=True, exist_ok=True)
+    prompt = build_prompt(target, args.focus)
+    (out_dir / "prompt.txt").write_text(prompt + "\n")
+
+    runs = []
+    for name in wanted:
+        command = codex_command(prompt, out_dir, args) if name == "codex" else claude_command(prompt, args)
+        run = Run(name, command, out_dir, args.timeout)
+        if shutil.which(name) is None:
+            run.status, run.detail = "skipped", f"`{name}` is not on PATH"
+        else:
+            start(run, repo)
+        runs.append(run)
+    wait_all(runs)
+    for run in runs:
+        if run.name == "codex" and run.status != "skipped":
+            collect_codex(run)
+        elif run.name == "claude" and run.status != "skipped":
+            collect_claude(run)
+
+    findings = [f for run in runs if run.review for f in normalize(run.review, run.name, repo)]
+    groups = merge(findings)
+    data = report(target, runs, groups)
+    (out_dir / "review.json").write_text(json.dumps(data, indent=2) + "\n")
+    print(json.dumps(data, indent=2) if args.json else render(target, runs, groups, out_dir), end="" if not args.json else "\n")
+
+    if not any(run.review is not None for run in runs):
+        return 2
+    return 1 if any(g.priority is not None and g.priority <= 1 for g in groups) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
