@@ -9,7 +9,7 @@ repo="$(gh repo view --json nameWithOwner -q .nameWithOwner)"
 head="$(gh pr view "$pr" --json headRefOid -q .headRefOid)"
 short="${head:0:7}"
 ready="$(gh api "repos/$repo/issues/$pr/timeline?per_page=100" -q '[.[] | select(.event=="ready_for_review") | .created_at] | last')"
-[ -n "$ready" ] && [ "$ready" != null ] || { echo "PR $pr was never marked ready"; exit 2; }
+if [ -z "$ready" ] || [ "$ready" = null ]; then echo "PR $pr was never marked ready"; exit 2; fi
 for _ in $(seq "$limit"); do
   row="$(gh api "repos/$repo/issues/$pr/comments?per_page=100" -q '.[] | select(.body|test("codex-pull-request-review-summary")) | .body' |
     grep -F 'Draft marked ready' | grep -F "\`$short\`" | tail -n 1)"
