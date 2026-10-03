@@ -1,5 +1,7 @@
 # Automated review triage
 
+The polling and trigger sections apply only when the repository uses a hosted review bot (Codex). The triage and stopping rules apply to every review, including local `open-code-review` findings.
+
 Use GitHub CLI or the repository's preferred provider tooling. Capture the PR number, repository, and current head SHA before interpreting results.
 
 ## Polling

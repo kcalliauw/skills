@@ -6,7 +6,7 @@ Agent skills for Claude Code, Codex and OpenCode, installable with the
 | Skill | What it does |
 |---|---|
 | [`cross-review`](skills/engineering/cross-review/) | Reviews a diff locally with Codex and Claude Code side by side, in a code-review pass (the Codex `/review` rubric) and a security pass, and prints one merged list of prioritized findings. *Work in progress: hidden from install lists until released.* |
-| [`babysit-pr`](skills/engineering/babysit-pr/) | Follows a pull request through CI and automated review, fixes actionable findings, and stops at the repository's merge gate. |
+| [`babysit-pr`](skills/engineering/babysit-pr/) | Follows a pull request through local `open-code-review` iterations, CI and any hosted review bot, fixes actionable findings, and stops at the repository's merge gate. |
 | [`expose-service`](skills/ops/expose-service/) | Exposes a local service on a Tailscale mesh (rinetd or `tailscale serve`) or to the internet (`tailscale funnel`). |
 
 ## Install
